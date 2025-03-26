@@ -1,6 +1,6 @@
 import numpy as np 
 import pandas as pd 
-from scipy.interpolate import interp1d, griddata
+from scipy.interpolate import interp1d
 import matplotlib.pyplot as plt
 from matplotlib import cm
 from math import ceil 
@@ -24,20 +24,18 @@ Predictive Haemodynamics in a One-Dimensional Carotid Artery Bifurcation.
 Part I: Application to Stent Design. IEEE Transactions on Biomedical Engineering 54 (5): 802-812, doi 10.1109/TBME.2006.889188
 
 TO DO : 
-    - Improve stability of the scheme to avoid oscillations in [0.8L, L]
-	- Flux computation, set up a average mean variable instead of just taking A, would be more accurate
+    - try to obtain results using pressure boundary condition [both inlet and outlet]
 	- Dispatch function in multiples scripts for readability
 	- Estimate alpha empirically with changing radius
-	- 
 '''
 
-def CFL_condition(u, a, alpha, rho, dx, dt, n, nt):
+def CFL_condition(u, a0, alpha, rho, dx, dt, n, nt):
 	"""
 	Allows us to check if the CFL condition is satisfied
 	
 	Parameters :
 	- u : float, average velocity at a given time step
-	- a : float, average cross sectional area at a given time step
+	- a0 : float, cross sectional area at rest
 	- alpha : float, elatance coefficient
 	- rho : float, blood density 
 	- dx : float, space step
@@ -49,14 +47,16 @@ def CFL_condition(u, a, alpha, rho, dx, dt, n, nt):
 	- No returned values if CFL respected (True), raise ValueError if not respected (False)
 	"""
 	
-	if (u + np.sqrt(alpha*a/rho))*(dt/dx) <= 1:
+	if (u + np.sqrt(alpha*a0/rho))*(dt/dx) <= 1:
+		if n == 1:
+			print("Wave speed [cm/s] : " + str(round(u + np.sqrt(alpha*a0/rho), 2)))
 		if (n == nt-1):
 			print("CFL Condition was satisfied for every time steps")
 		else:
 			pass
 	else:
 		raise ValueError("The CFL condition isn't satisfied")
-	
+
 def Three_wave_component(t):
 	"""
 	Creates an inflow function obtained as a sum of simulated percussion, tidal and dicrotic  wave
@@ -136,10 +136,10 @@ def write_data(A, P, Q, x, t):
 	if not exists("data/"):
 		makedirs("data/")
 	np.savetxt("data/area.csv", A[:,:], delimiter=',')
-	np.savetxt("data/pressure1.csv", P[:,:], delimiter=',')
+	np.savetxt("data/pressure.csv", P[:,:], delimiter=',')
 	np.savetxt("data/flow.csv", Q[:,:], delimiter=',')
-	np.savetxt("data/xpoint1.csv", x[:], delimiter=',')
-	np.savetxt("data/tpoint1.csv", t[:], delimiter=',')
+	np.savetxt("data/xpoint.csv", x[:], delimiter=',')
+	np.savetxt("data/tpoint.csv", t[:], delimiter=',')
 
 def periodic(t, T):
 	"""
@@ -154,10 +154,11 @@ def periodic(t, T):
 	"""
 	return t % T
 
-def inlet_bc(Q_inlet, n, A, A0_normal, Q, dx, dt, mu, rho, alpha, T):
+def inlet_bc(Q_inlet, n, A, Q, dx, dt, mu, rho, alpha, T):
 	"""
 	Applies the inlet boundary condition for the vessel.
 	doi 10.1109/TBME.2006.889188 | doi 10.1114/1.1326031
+
 	Parameters :
 	- Q_inlet : interpolated function of the flow rate at the inlet of the vessel
 	- n : integer representing the current time step 
@@ -177,14 +178,14 @@ def inlet_bc(Q_inlet, n, A, A0_normal, Q, dx, dt, mu, rho, alpha, T):
 	"""
 	time = n*dt
 	q_inlet = Q_inlet(periodic(time,T)) # q^{n+1}_0
-	q_nph_0 = Q_inlet(periodic(time-dt/2,T)) # q^{n+1/2}_0
+	q_nph_0 = Q_inlet(periodic(time-(dt/2),T)) # q^{n+1/2}_0
 	q_np_half = 0.5*(Q[1] + Q[0]) - 0.5 * (dt/dx) * (Flux(Q,A,A0,alpha, rho, j = 1, k = 2) - Flux(Q,A,A0,alpha,rho,j = 0, k = 1))\
-			  + dt/2 * (Source(Q,A,mu,rho, j = 1, k = 2) + Source(Q,A,mu,rho, j = 0, k = 1)) # q^{n+1/2}_{1/2}
+			  + dt/4 * (Source(Q,A,mu,rho, j = 1, k = 2) + Source(Q,A,mu,rho, j = 0, k = 1)) # q^{n+1/2}_{1/2}
 	q_m_half = 2*q_nph_0 - q_np_half # q^{n+1/2}_{-1/2}
-	a_inlet = A[0] - (dt/dx) * (q_np_half - q_m_half) # A^{n+1}_0ss
+	a_inlet = A[0] - (dt/dx) * (q_np_half - q_m_half) # A^{n+1}_0
 	return a_inlet[0], q_inlet
 
-def WK_outlet_bc(R1, R2, C, Q, A, A0, A0_normal, dx, dt, mu, rho, alpha):
+def WK_outlet_bc(R1, R2, C, Q, A, A0, dx, dt, mu, rho, alpha, diastolic_pressure):
 	"""
 	Computes the outlet boundary condition basing on the three element windkessel (3WK) model by using the fixed point iteration method.
 	doi 10.1109/TBME.2006.889188 | doi 10.1114/1.1326031
@@ -199,6 +200,7 @@ def WK_outlet_bc(R1, R2, C, Q, A, A0, A0_normal, dx, dt, mu, rho, alpha):
 	- mu : float representing the blood viscosity 
 	- rho : float representing the blood density
 	- alpha : elastance coefficient
+	- diastolic_pressure : float representing average diastolic pressure
 
 	Returns :
 	- a_outlet : float corresponding to the cross-sectional area at the outlet of the vessel
@@ -206,27 +208,26 @@ def WK_outlet_bc(R1, R2, C, Q, A, A0, A0_normal, dx, dt, mu, rho, alpha):
 	"""
 	q_n = Q[-1] 
 	a_n = A[-1]
-	p_m_p1 = p_n = alpha*(a_n - A0[-1]) # Initial guess for pressure at outlet (same as before, i.e p^{n+1}_M = p^n_M)
+	p_m_p1 = p_n = alpha*(a_n - A0[-1]) + diastolic_pressure*1333.22# Initial guess for pressure at outlet (same as before, i.e p^{n+1}_M = p^n_M)
 
 	A_np_mp = 0.5 * (A[-1] + A[-2]) - 0.5 * (dt/dx) * (Q[-1] - Q[-2])
 	A_np_mm = 0.5 * (A[-2] + A[-3]) - 0.5 * (dt/dx) * (Q[-2] - Q[-3])
 
 	Q_np_mp = (0.5 * (Q[-1] + Q[-2]) - 0.5 * (dt/dx) * (Flux(Q,A,A0,alpha, rho, j = -1) - Flux(Q,A,A0,alpha, rho, j = -2, k = -1))\
-			+ (dt/2) * (Source(Q,A,mu,rho, j = -1) + Source(Q,A,mu,rho, j = -2, k = -1)))
+			+ (dt/4) * (Source(Q,A,mu,rho, j = -1) + Source(Q,A,mu,rho, j = -2, k = -1)))
 	
 	Q_np_mm = (0.5 * (Q[-2] + Q[-3]) - 0.5 * (dt/dx) * (Flux(Q,A,A0,alpha, rho, j = -2, k = -1) - Flux(Q,A,A0,alpha, rho, j = -3, k = -2))\
-			+ (dt/2) * (Source(Q,A,mu,rho, j = -2, k = -1) + Source(Q,A,mu,rho, j = -3, k = -2)))
+			+ (dt/4) * (Source(Q,A,mu,rho, j = -2, k = -1) + Source(Q,A,mu,rho, j = -3, k = -2)))
 	
-	Q_mm = Q[-2] - dt/dx * (Q_np_mp**2/A_np_mp +alpha/rho * 0.5*(A_np_mp + A_np_mm) * (A_np_mp - A0_half_p[-2]) - Q_np_mm**2/A_np_mm +alpha/rho * 0.5*(A_np_mp + A_np_mm) * (A_np_mm - A0_half_m[-2]))\
+	Q_mm = Q[-2] - dt/dx * (Q_np_mp**2/A_np_mp - Q_np_mm**2/A_np_mm + alpha/rho * A[-2] * ((A_np_mp - A0_half_p[-2]) - (A_np_mm - A0_half_m[-2])))\
 		 - (dt/2) * (8*np.pi*mu)/(rho) * (Q_np_mp/A_np_mp + Q_np_mm/A_np_mm)
 
 	k = 0
-	while k < 100:
+	while k < 1000:
 		p_old = p_m_p1
 		q_outlet = ((p_old - p_n)/R1) + q_n + (dt*p_n)/(R1*C*R2) - (q_n*(R1+R2)*dt)/(C*R1*R2)
 		a_outlet = a_n - (dt/dx)*(q_outlet - Q_mm[0])
-		p_m_p1 = alpha*(a_outlet - A0[-1])
-		#print(q_outlet)
+		p_m_p1 = alpha*(a_outlet - A0[-1]) + diastolic_pressure*1333.22
 		if abs(p_m_p1 - p_old) < 1e-7:
 			break
 		k +=1
@@ -387,14 +388,11 @@ if __name__ == '__main__':
 	L = 20.9						# Length of the vessel [cm]
 	nx = 209						# Number of spatial points
 	rho = 1.06						# Blood density [g/cm^3]
-	mu = 3.5e-2						# Blood viscosity [g/(cm.s)]
-	alpha = 2.2e6 					# Elastance [g/(cm^3.s^2)]
-	intra_pressure = 15				# Intracranial pressure [mmHg]
+	mu = 3.5e-2						# Blood viscosity [g/(cm.s)] 				
+	diastolic_pressure = 70			# Average diastolic pressure [mmHg]
+	
 	r_normal = 3.7e-1			    # Vessel radius at rest in a normal vessel [cm]
-	A0_normal = np.pi * r_normal**2 # Cross sectionnal area at rest [cm²]
-	#A0_normal = 2.4e-2				# ACA
-	#A0_normal = 1.2e-1
-	#r_normal = np.sqrt(A0_normal/np.pi)
+	A0_normal = np.pi * r_normal**2 # Cross sectionnal area at rest [cm²] (0.43)
 
 	# Space and time discretisation
 
@@ -425,16 +423,17 @@ if __name__ == '__main__':
 
 	# Parameters to estimate alpha empirically based on https://doi.org/10.1114/1.1326031
 
-	k1 = 2.0e+7 					# Constant 1 [g/(s² cm)]
+	k1 = 2.0e7	 					# Constant 1 [g/(s² cm)]
 	k2 = -22.53 					# Constant 2 [cm^-1]
-	k3 = 8.65e+5 					# Constant 3 [g/(s² cm)]
-	alpha = (k1*np.exp(k2*r_normal) + k3)/(2*A0_normal)
-	
+	k3 = 8.65e5 					# Constant 3 [g/(s² cm)]
+	alpha = (k1*np.exp(k2*r_normal) + k3)/(2*A0_normal) # Elastance [g/(cm^3.s^2)]
+	print(alpha)
+
 	# 3WK BC parameters
 
-	R1 = 13_900						# First resistance [g/s * cm^{-4}]
-	R2 = 25_300						# Second resistance [g/s * cm^{-4}]
-	C = 1.3984e-6					# Capacitance coefficient [cm^4.s^2/g]
+	R1 = 13900						# First resistance [g/s * cm^{-4}]
+	R2 = 25300						# Second resistance [g/s * cm^{-4}]
+	C = 1.3384e-6					# Capacitance coefficient [cm^4.s^2/g]
 
 	# Get inlet as a function (:= Q_inlet)
 
@@ -457,6 +456,8 @@ if __name__ == '__main__':
 	A_data = np.zeros_like(Q_data)
 
 	# Variables needed in LW 2 steps scheme (Speed + Pressure)
+	#A = 0.65*np.ones(nx) #A0.copy()
+	
 	A = A0.copy()
 	Q = np.zeros_like(A) 
 
@@ -469,19 +470,22 @@ if __name__ == '__main__':
 	A0_half_m = 0.5*(A0[1:-1] + A0[0:-2])
 	A0_half_p = 0.5*(A0[1:-1] + A0[2:]) 
 	plt.figure()
-	plt.plot(x,r)
-	plt.show()
+	plt.plot(x,A)
+	#plt.show()
 
 	dtdx = dt/dx
 	dtover2 = dt/2
 
+
 	for n in tqdm(range(1,nt)): 	# tqdm is here to give an approximation of the time left, so we dont wait in front of the screen doing nothing :)
-
+	
 		# Inlet conditions 
-		A[0], Q[0] = inlet_bc(Q_inlet, n, A, A0_normal, Q, dx, dt, mu, rho, alpha, T)
+		A[0], Q[0] = inlet_bc(Q_inlet, n, A, Q, dx, dt, mu, rho, alpha, T)
 
+		
 		# Outlet conditions
-		A[-1], Q[-1] = WK_outlet_bc(R1, R2, C, Q, A, A0, A0_normal, dx, dt, mu, rho, alpha)
+		A[-1], Q[-1] = WK_outlet_bc(R1, R2, C, Q, A, A0, dx, dt, mu, rho, alpha, diastolic_pressure)
+		
 
 		# Half time/space step 
 		
@@ -489,24 +493,24 @@ if __name__ == '__main__':
 		A_half_m = 0.5 * (A[1:-1] + A[0:-2]) - 0.5 * dtdx * (Q[1:-1] - Q[0:-2]) 
 
 		Q_half_p = 0.5 * (Q[2:] + Q[1:-1]) - 0.5* dtdx * (Flux(Q,A,A0,alpha,rho, j = 2) - Flux(Q,A,A0, alpha, rho, j = 1, k = -1)) \
-			+ (dtover2) * (Source(Q,A,mu,rho, j = 2) + Source(Q,A,mu,rho, j =1, k = -1))
+			+ 0.5*(dtover2) * (Source(Q,A,mu,rho, j = 2) + Source(Q,A,mu,rho, j =1, k = -1))
 		
 		Q_half_m = 0.5 * (Q[1:-1] + Q[0:-2]) - 0.5* dtdx * (Flux(Q,A,A0,alpha,rho, j = 1, k = -1) - Flux(Q,A,A0, alpha, rho, j = 0, k = -2)) \
-			+ (dtover2) * (Source(Q,A,mu,rho, j = 1, k = -1) + Source(Q,A,mu,rho, j =0, k = -2))
+			+ 0.5*(dtover2) * (Source(Q,A,mu,rho, j = 1, k = -1) + Source(Q,A,mu,rho, j =0, k = -2))
 		
 		# Full step
 		
 		A[1:-1] = A[1:-1] - dtdx * (Q_half_p - Q_half_m)
 		
 		Q[1:-1] = Q[1:-1] - dtdx * (Flux(Q_half_p, A_half_p, A0_half_p, alpha, rho, j = 0) - Flux(Q_half_m, A_half_m, A0_half_m, alpha, rho, j = 0))\
-				+ dtover2 * (Source(Q_half_p, A_half_p, mu, rho, j = 0) + Source(Q_half_m, A_half_m, mu, rho, j = 0))# + 0.1 * (Q[0:-2] -2* Q[1:-1] + Q[2:])
-
+				+ dtover2 * (Source(Q_half_p, A_half_p, mu, rho, j = 0) + Source(Q_half_m, A_half_m, mu, rho, j = 0)) 
+		
 		# Checking if the cfl condition is still satisfied 
 		
 		mean_u = np.mean(Q/A)
-		mean_a = np.mean(A)
 
-		CFL_condition(mean_u, mean_a, alpha, rho, dx, dt, n, nt)
+		# Checking if the CFL condition is satisfied
+		CFL_condition(mean_u, A0_normal,  alpha, rho, dx, dt, n, nt)
 
 		if n % time_interval == 0:
 			# Live plot (optional), it tends to slow down the simulation + window might superpose with other windows
@@ -514,7 +518,7 @@ if __name__ == '__main__':
 				plt.figure(1, figsize=(10, 6))
 				plt.clf()
 
-				plt.subplot(2, 1, 1)
+				plt.subplot(4, 1, 1)
 				plt.plot(x, A, 'b-', linewidth=1.5)
 				plt.title(f'Cross-sectional Area (A) at t = {n * dt:.2f} s')
 				plt.xlabel('Position (cm)')
@@ -523,7 +527,7 @@ if __name__ == '__main__':
 				plt.ylim([0.8 * A0_normal, 1.5 * A0_normal])
 				plt.grid(True)
 
-				plt.subplot(2, 1, 2)
+				plt.subplot(4, 1, 2)
 				plt.plot(x, Q, 'r-', linewidth=1.5)
 				plt.title(f'Flow Rate (Q) at t = {n * dt:.2f} s')
 				plt.xlabel('Position (cm)')
@@ -534,6 +538,25 @@ if __name__ == '__main__':
 				else:
 					plt.ylim([0, 5])
 				plt.grid(True)
+
+				plt.subplot(4, 1, 3)
+				plt.plot(x, Q/A, 'b-', linewidth=1.5)
+				plt.title(f'Velocity (U) at t = {n * dt:.2f} s')
+				plt.xlabel('Position (cm)')
+				plt.ylabel('U (cm/s)')
+				plt.xlim([0, L])
+				plt.ylim([0, 10])
+				plt.grid(True)
+
+				plt.subplot(4, 1, 4)
+				plt.plot(x, alpha*(A-A0)/1333.22 + diastolic_pressure, 'r-', linewidth=1.5)
+				plt.title(f'Transmural Pressure (P) at t = {n * dt:.2f} s')
+				plt.xlabel('Position (cm)')
+				plt.ylabel('P (mmHg)')
+				plt.xlim([0, L])
+				plt.ylim([20, 200])
+				plt.grid(True)
+
 				plt.pause(0.001)
 
 		if n*dt >= t_min_plot and n*dt <= t_max_plot and n% time_interval == 0:
@@ -555,7 +578,7 @@ if __name__ == '__main__':
 	else:
 		pass
 
-	P_data = intra_pressure + (alpha * ((A_data) - A0))/1333.322  # Pressure in mmHg | 
+	P_data = diastolic_pressure + (alpha * ((A_data) - A0))/1333.322  # Pressure in mmHg | 
 	U_data = Q_data/A_data
 
 	print(np.max(A_data[:,:]))
