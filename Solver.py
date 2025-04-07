@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 from math import ceil 
 from tqdm import tqdm
+import bisect
 
 from os import makedirs
 from os.path import exists
@@ -24,9 +25,9 @@ Predictive Haemodynamics in a One-Dimensional Carotid Artery Bifurcation.
 Part I: Application to Stent Design. IEEE Transactions on Biomedical Engineering 54 (5): 802-812, doi 10.1109/TBME.2006.889188
 
 TO DO : 
-    - try to obtain results using pressure boundary condition [both inlet and outlet]
+	- Priority : Check dB/dr dr/dz term 
+    - Update pressure boundary condition
 	- Dispatch function in multiples scripts for readability
-	- Estimate alpha empirically with changing radius
 '''
 
 def CFL_condition(u, a0, alpha, rho, dx, dt, n, nt):
@@ -49,13 +50,13 @@ def CFL_condition(u, a0, alpha, rho, dx, dt, n, nt):
 	
 	if (u + np.sqrt(alpha*a0/rho))*(dt/dx) <= 1:
 		if n == 1:
-			print("Wave speed [cm/s] : " + str(round(u + np.sqrt(alpha*a0/rho), 2)))
+			print("Wave speed [cm/s] : " + str(round(np.sqrt(alpha*a0/rho), 2)))
 		if (n == nt-1):
 			print("CFL Condition was satisfied for every time steps")
 		else:
 			pass
 	else:
-		raise ValueError("The CFL condition isn't satisfied")
+		raise ValueError("The CFL condition isn't satisfied, the time step needs to be lower")
 
 def Three_wave_component(t):
 	"""
@@ -136,10 +137,10 @@ def write_data(A, P, Q, x, t):
 	if not exists("data/"):
 		makedirs("data/")
 	np.savetxt("data/area.csv", A[:,:], delimiter=',')
-	np.savetxt("data/pressure.csv", P[:,:], delimiter=',')
+	np.savetxt("data/pressure1.csv", P[:,:], delimiter=',')
 	np.savetxt("data/flow.csv", Q[:,:], delimiter=',')
-	np.savetxt("data/xpoint.csv", x[:], delimiter=',')
-	np.savetxt("data/tpoint.csv", t[:], delimiter=',')
+	np.savetxt("data/xpoint1.csv", x[:], delimiter=',')
+	np.savetxt("data/tpoint1.csv", t[:], delimiter=',')
 
 def periodic(t, T):
 	"""
@@ -154,7 +155,7 @@ def periodic(t, T):
 	"""
 	return t % T
 
-def inlet_bc(Q_inlet, n, A, Q, dx, dt, mu, rho, alpha, T):
+def inlet_bc(Q_inlet, n, A, Q, dx, dt, mu, rho, alpha, dalphadr, T, drdz):
 	"""
 	Applies the inlet boundary condition for the vessel.
 	doi 10.1109/TBME.2006.889188 | doi 10.1114/1.1326031
@@ -168,8 +169,10 @@ def inlet_bc(Q_inlet, n, A, Q, dx, dt, mu, rho, alpha, T):
 	- dt : float representing the time step
 	- mu : float representing the blood viscosity
 	- rho : float representing the blood density
-	- alpha : float representing the elastance coefficient
+	- alpha : array representing the elastance coefficient
+	- dalphadr : array with dalpha/dr
 	- T : float representing the period length
+	- drdz : array containing the values for dr/dz
 
 	Returns :
 	- a_inlet : float corresponding to the cross-sectional area at the inlet of the vessel
@@ -180,12 +183,12 @@ def inlet_bc(Q_inlet, n, A, Q, dx, dt, mu, rho, alpha, T):
 	q_inlet = Q_inlet(periodic(time,T)) # q^{n+1}_0
 	q_nph_0 = Q_inlet(periodic(time-(dt/2),T)) # q^{n+1/2}_0
 	q_np_half = 0.5*(Q[1] + Q[0]) - 0.5 * (dt/dx) * (Flux(Q,A,A0,alpha, rho, j = 1, k = 2) - Flux(Q,A,A0,alpha,rho,j = 0, k = 1))\
-			  + dt/4 * (Source(Q,A,mu,rho, j = 1, k = 2) + Source(Q,A,mu,rho, j = 0, k = 1)) # q^{n+1/2}_{1/2}
+			  + dt/2 * (Source(Q,A,A0, mu,rho, drdz,alpha,dalphadr, j = 1, k = 2) + Source(Q,A,A0,mu,rho,drdz,alpha,dalphadr, j = 0, k = 1)) # q^{n+1/2}_{1/2}
 	q_m_half = 2*q_nph_0 - q_np_half # q^{n+1/2}_{-1/2}
 	a_inlet = A[0] - (dt/dx) * (q_np_half - q_m_half) # A^{n+1}_0
 	return a_inlet[0], q_inlet
 
-def WK_outlet_bc(R1, R2, C, Q, A, A0, dx, dt, mu, rho, alpha, diastolic_pressure):
+def WK_outlet_bc(R1, R2, C, Q, A, A0, dx, dt, mu, rho, alpha, dalphadr, diastolic_pressure, drdz, drdzhp, drdzhm):
 	"""
 	Computes the outlet boundary condition basing on the three element windkessel (3WK) model by using the fixed point iteration method.
 	doi 10.1109/TBME.2006.889188 | doi 10.1114/1.1326031
@@ -200,7 +203,11 @@ def WK_outlet_bc(R1, R2, C, Q, A, A0, dx, dt, mu, rho, alpha, diastolic_pressure
 	- mu : float representing the blood viscosity 
 	- rho : float representing the blood density
 	- alpha : elastance coefficient
+	- dalphadr
 	- diastolic_pressure : float representing average diastolic pressure
+	- drdz : array containing the values for dr/dz
+	- drdzhp
+	- drdzhm
 
 	Returns :
 	- a_outlet : float corresponding to the cross-sectional area at the outlet of the vessel
@@ -208,26 +215,27 @@ def WK_outlet_bc(R1, R2, C, Q, A, A0, dx, dt, mu, rho, alpha, diastolic_pressure
 	"""
 	q_n = Q[-1] 
 	a_n = A[-1]
-	p_m_p1 = p_n = alpha*(a_n - A0[-1]) + diastolic_pressure*1333.22# Initial guess for pressure at outlet (same as before, i.e p^{n+1}_M = p^n_M)
+	p_m_p1 = p_n = alpha[-1]*(a_n - A0[-1]) + diastolic_pressure*1333.22# Initial guess for pressure at outlet (same as before, i.e p^{n+1}_M = p^n_M)
 
 	A_np_mp = 0.5 * (A[-1] + A[-2]) - 0.5 * (dt/dx) * (Q[-1] - Q[-2])
 	A_np_mm = 0.5 * (A[-2] + A[-3]) - 0.5 * (dt/dx) * (Q[-2] - Q[-3])
 
 	Q_np_mp = (0.5 * (Q[-1] + Q[-2]) - 0.5 * (dt/dx) * (Flux(Q,A,A0,alpha, rho, j = -1) - Flux(Q,A,A0,alpha, rho, j = -2, k = -1))\
-			+ (dt/4) * (Source(Q,A,mu,rho, j = -1) + Source(Q,A,mu,rho, j = -2, k = -1)))
+			+ (dt/2) * (Source(Q,A,A0,mu,rho,drdz,alpha,dalphadr, j = -1) + Source(Q,A,A0,mu,rho,drdz,alpha,dalphadr, j = -2, k = -1)))
 	
 	Q_np_mm = (0.5 * (Q[-2] + Q[-3]) - 0.5 * (dt/dx) * (Flux(Q,A,A0,alpha, rho, j = -2, k = -1) - Flux(Q,A,A0,alpha, rho, j = -3, k = -2))\
-			+ (dt/4) * (Source(Q,A,mu,rho, j = -2, k = -1) + Source(Q,A,mu,rho, j = -3, k = -2)))
+			+ (dt/2) * (Source(Q,A,A0,mu,rho,drdz,alpha,dalphadr, j = -2, k = -1) + Source(Q,A,A0,mu,rho,drdz,alpha,dalphadr, j = -3, k = -2)))
 	
-	Q_mm = Q[-2] - dt/dx * (Q_np_mp**2/A_np_mp - Q_np_mm**2/A_np_mm + alpha/rho * A[-2] * ((A_np_mp - A0_half_p[-2]) - (A_np_mm - A0_half_m[-2])))\
-		 - (dt/2) * (8*np.pi*mu)/(rho) * (Q_np_mp/A_np_mp + Q_np_mm/A_np_mm)
+	Q_mm = Q[-2] - dt/dx * (Q_np_mp**2/A_np_mp + alpha/(2*rho) * (A_np_mp**2 - A0[-2]**2) - Q_np_mm**2/A_np_mm - alpha[-2]/(2*rho) * (A_np_mm**2 - A0[-2]**2))\
+		 - (dt/2) * ((8*np.pi*mu)/(rho) * (Q_np_mp/A_np_mp + Q_np_mm/A_np_mm) - (1/(2*rho))*((A_np_mp**2 - A0[-2]**2)*dalpha_half_p[-2] - 4*((np.pi)**2) * (np.sqrt(A0[-2]/np.pi))**3 * alpha_half_p[-2])*drdzhp[-2]\
+	    - (1/(2*rho))*((A_np_mm**2 - A0[-2]**2)*dalpha_half_m[-2] - 4*((np.pi)**2) * (np.sqrt(A0[-2]/np.pi))**3 * alpha_half_m[-2])*drdzhm[-2])
 
 	k = 0
 	while k < 1000:
 		p_old = p_m_p1
 		q_outlet = ((p_old - p_n)/R1) + q_n + (dt*p_n)/(R1*C*R2) - (q_n*(R1+R2)*dt)/(C*R1*R2)
 		a_outlet = a_n - (dt/dx)*(q_outlet - Q_mm[0])
-		p_m_p1 = alpha*(a_outlet - A0[-1]) + diastolic_pressure*1333.22
+		p_m_p1 = alpha[-1]*(a_outlet - A0[-1]) + diastolic_pressure*1333.22
 		if abs(p_m_p1 - p_old) < 1e-7:
 			break
 		k +=1
@@ -263,9 +271,12 @@ def pressure_outlet(P, A, A0, Q, alpha, rho, mu, dx, dt):
 	a_np_mp = 2*a_out - a_np_mm
 	q_np_mp = (a_n - a_out)*(dx/dt) + q_np_mm
 
-	q_out = q_n - (dt/dx) * (q_np_mp**2/a_np_mp - q_np_mm**2/a_np_mm) \
-		- (alpha/rho) * dt/(dx) * (a_np_mp + a_np_mm) * (a_np_mp - a_np_mm)  \
-		+ (8 * np.pi * mu * dt)/(2*rho) * (q_np_mp/a_np_mp + q_np_mm/a_np_mm) 
+	rhp = np.sqrt(A0_half_p[-1]/np.pi)
+	rhm = np.sqrt(A0_half_m[-1]/np.pi)
+	
+	q_out = q_n - (dt/dx) * (q_np_mp**2/a_np_mp + (alpha_half_p[-1]/(2*rho)) * (a_np_mp - A0_half_p[-1]) - (q_np_mm**2/a_np_mm + (alpha_half_m[-1]/(2*rho)) * (a_np_mm - A0_half_m[-1]))) + (dt/2) * \
+	(-(8*np.pi*mu)/(rho)*(q_np_mp/a_np_mp)- (1/(2*rho))*((a_np_mp**2 - A0_half_p[-1]**2)*dalpha_half_p[-1] - 4*((np.pi)**2) * (rhp**3) * alpha_half_p[-1])*drdz_half_p[-1] \
+	-(8*np.pi*mu)/(rho)*(q_np_mm/a_np_mm) - (1/(2*rho))*((a_np_mm**2 - A0_half_m[-1]**2)*dalpha_half_m[-1] - 4*((np.pi)**2) * (rhm**3) * alpha_half_m[-1])*drdz_half_m[-1])
 	
 	return a_out, q_out	
 
@@ -293,20 +304,24 @@ def pressure_inlet(P, A, A0, Q, alpha, rho, mu, dx, dt):
 	a_in = ((P/alpha))+A0[0]
 
 	a_np_mp = 0.5*(A[0] + A[1]) - dt/(2*dx) * (Q[1] - Q[0])
-	q_np_mp = 0.5*(Q[1] + Q[0]) - 0.5 * (dt/dx) * (Flux(Q, A, A0, alpha, rho, j = 1, k = 2) - Flux(Q, A, A0, alpha, rho, j = 0, k = 1)) \
-				+ (dt/2) * (Source(Q, A, mu, rho, j = 1, k = 2) + Source(Q, A, mu, rho, j = 0, k = 1)) # q^{n+1/2}_{1/2}
+	q_np_mp = 0.5*(Q[1] + Q[0]) - 0.5 * (dt/dx) * (Flux(Q,A,A0,alpha, rho, j = 1, k = 2) - Flux(Q,A,A0,alpha,rho,j = 0, k = 1))\
+			  + dt/2 * (Source(Q,A,A0, mu,rho, drdz,alpha,dalphadr, j = 1, k = 2) + Source(Q,A,A0,mu,rho,drdz,alpha,dalphadr, j = 0, k = 1)) # q^{n+1/2}_{1/2}
 	
 	a_np_mm = 2*a_0 - a_np_mp
 	q_np_mm = q_np_mp + (dx/dt) * (a_in - a_0)
 
-	q_in = q_0 - (dt/dx) * (q_np_mp**2/a_np_mp - q_np_mm**2/a_np_mm) \
-		- (alpha/rho) * dt/(2*dx) * (a_np_mp + a_np_mm) * (a_np_mp - a_np_mm)  \
-		- (8 * np.pi * mu * dt)/(2*rho) * (q_np_mp/a_np_mp + q_np_mm/a_np_mm) 
+	rhp = np.sqrt(A0_half_p[0]/np.pi)
+	rhm = np.sqrt(A0_half_m[0]/np.pi)
+
+	q_in = q_0 - (dt/dx) * (q_np_mp**2/a_np_mp + (alpha_half_p[0]/(2*rho)) * (a_np_mp - A0_half_p[0]) - (q_np_mm**2/a_np_mm + (alpha_half_m[0]/(2*rho)) * (a_np_mm - A0_half_m[0]))) + (dt/2) * \
+	(-(8*np.pi*mu)/(rho)*(q_np_mp/a_np_mp)- (1/(2*rho))*((a_np_mp**2 - A0_half_p[0]**2)*dalpha_half_p[0] - 4*((np.pi)**2) * (rhp**3) * alpha_half_p[0])*drdz_half_p[0] \
+	-(8*np.pi*mu)/(rho)*(q_np_mm/a_np_mm) - (1/(2*rho))*((a_np_mm**2 - A0_half_m[0]**2)*dalpha_half_m[0] - 4*((np.pi)**2) * (rhm**3) * alpha_half_m[0])*drdz_half_m[0])
+	
 	return a_in, q_in
 
 def HicksHenneBump(x, x_anomaly, x_width, a, r0, stenosis, aneurysm):
 	"""
-	Returns the cross-sectional area of the vessel with a bump
+	Returns the cross-sectional area of the vessel with a bump [needs update to generate a function which is C1]
 
 	Parameters :
 	- x : float representing the spatial point (for convenience we normalize to get [0,1])
@@ -325,6 +340,41 @@ def HicksHenneBump(x, x_anomaly, x_width, a, r0, stenosis, aneurysm):
 	else:
 		r = r0*np.ones_like(x)
 	return r
+
+def drdx(x, stenosis, aneurysm, x_anomaly, x_width, a, x_start, x_end):
+	"""
+	Placeholder but will be used to compute dr0/dz used for the source term,
+
+	Parameters :
+	- x : array containing Discretized artery
+	- stenosis, aneurysm : boolean representing if the vessel has an anomaly or not
+	- x_anomaly : float representing the location of the maximum point of the bump (in [0,1])
+	- x_width : float representing the width of the bump (in [0,L])
+	- a : float representing the amplitude of the bump (in [0,r0])
+	- x_start : beginning of the anomaly 
+	- x_end : end of the anomaly
+
+	Returns :
+	- dr : array corresponding to the exact computed value of dr/dz
+	"""
+	if stenosis or aneurysm:
+		index_min = bisect.bisect_left(x, x_start)
+		index_max = bisect.bisect_left(x, x_end)
+
+		y = np.linspace(0, 1, index_max-index_min +1)
+		exponent = np.log(0.5) / np.log(x_anomaly)
+		sin_arg = np.pi * y**exponent
+		dr_anomaly = (-np.log(2) * np.pi * a * y**(-1 + exponent) * x_width * np.cos(sin_arg) * (np.sin(sin_arg) ** (x_width - 1)) / np.log(x_anomaly))
+		#dr_anomaly = a*(np.pi**x_width)*powx*(y**(powx-1))*np.cos((np.pi**x_width)*(y**powx))
+		
+		dr = np.zeros_like(x)
+		dr[index_min:index_max+1] = dr_anomaly
+		if aneurysm:
+			return dr
+		else:
+			return -dr
+	else:
+		return np.zeros_like(x)
 
 def Flux(Q, A, A0, alpha, rho, **kwargs):
 	"""
@@ -346,24 +396,31 @@ def Flux(Q, A, A0, alpha, rho, **kwargs):
 		q = Q[j:]
 		a = A[j:]
 		a0 = A0[j:]
+		al = alpha[j:]
 	if 'k' in kwargs:
 		k = kwargs['k']
 		q = Q[j:k]
 		a = A[j:k]
 		a0 = A0[j:k]
+		al = alpha[j:k]
 	if 'j' not in kwargs and 'k' not in kwargs:
 		raise IndexError("At least the start index 'j' must be specified")
-	return np.pow(q,2)/a + (alpha/rho)*(a)*(a-a0)
+	res = np.pow(q,2)/a + (al/(2*rho))*(np.pow(a,2)-np.pow(a0,2))
+	return res
 
-def Source(Q, A, mu, rho, **kwargs):
+def Source(Q, A, A0, mu, rho, dr, alpha, dalphadr, **kwargs):
 	"""
 	Computes the source term used during the discretisation
 
 	Parameters : 
 	- Q : array containing the flow rate at each spatial point
 	- A : array containing the cross-sectional area at each spatial point
-	- alpha : float for the elastance coefficient
+	- A0 : array containing the cross-sectional area at rest at each spatial point
+	- mu : float for the blood viscosity
 	- rho : float for the blood density
+	- alpha : array for the elastance coefficient
+	- dalphadr : array for ∂alpha/∂r
+	- dr : array containing the values of ∂r/∂z
 
 	- Keywords arguments :
 		- j : index variable = start (mandatory)
@@ -373,26 +430,71 @@ def Source(Q, A, mu, rho, **kwargs):
 		j = kwargs['j']
 		q = Q[j:]
 		a = A[j:]
+		a0 = A0[j:]
+		drdz = dr[j:]
+		al = alpha[j:]
+		dal = dalphadr[j:]
 	if 'k' in kwargs:
 		k = kwargs['k']
 		q = Q[j:k]
 		a = A[j:k]
+		a0 = A0[j:k]
+		drdz = dr[j:k]
+		al = alpha[j:k]
+		dal = dalphadr[j:k]
 	if 'j' not in kwargs and 'k' not in kwargs:
 		raise IndexError("At least the start index 'j' must be specified")
-	return -(8*np.pi*mu)/(rho)*(q/a)
+	r0 = np.sqrt(a0/np.pi)
+	res = -(8*np.pi*mu)/(rho)*(q/a)\
+		  - (1/(2*rho))*((a**2 - a0**2)*dal - 4*((np.pi)**2) * (r0**3) * al)*drdz
+	return res
+
+def gaussian_aneurysm(x, A, mu, sigma):
+    """
+    Function that return the radius of a vessel concerned by an aneurism at each point of the discretization.
+    Contrary to HicksHenneBump function, this function is C1.
+    
+    Parameters :
+    - x: float/array : spatial points
+    - A: float corresponding to the normalizing constant (= amplitude of the bump)
+    - mu: location of the amplitude (in [0,L])
+    - sigma: Standard deviation  (in ]0, min(mu, abs(mu-L))/3])
+    
+    Returns: 
+	- res : Value of the gaussian function (vessel radius) at the spatial point x
+    """
+    return A * np.exp(-((x - mu) ** 2) / (2 * sigma ** 2))
+
+def gaussian_derivative(x, A, mu, sigma):
+    """
+    Derivative of the gaussian function which is used to define the vessel radius
+    
+    Parameters :
+    - x: float/array : spatial points
+    - A: float corresponding to the normalizing constant (= amplitude of the bump)
+    - mu: location of the amplitude (in [0,L])
+    - sigma: Standard deviation  (in ]0, min(mu, abs(mu-L))/3])
+    
+    Returns :
+    - res : Value of the derivative at the spatial point x
+    """
+    return -A * (x - mu) / (sigma ** 2) * np.exp(-((x - mu) ** 2) / (2 * sigma ** 2))
 
 if __name__ == '__main__':
 	
 	# Vessel parameters | Carotid bifurcation, parent vessel 
 
 	L = 20.9						# Length of the vessel [cm]
-	nx = 209						# Number of spatial points
+	nx = 104						# Number of spatial points
 	rho = 1.06						# Blood density [g/cm^3]
 	mu = 3.5e-2						# Blood viscosity [g/(cm.s)] 				
 	diastolic_pressure = 70			# Average diastolic pressure [mmHg]
 	
-	r_normal = 3.7e-1			    # Vessel radius at rest in a normal vessel [cm]
-	A0_normal = np.pi * r_normal**2 # Cross sectionnal area at rest [cm²] (0.43)
+	r_normal = 3.7e-1  				# Vessel radius at rest in a normal vessel [cm]
+	A0_normal = np.pi * r_normal**2 # Cross sectionnal area at rest [cm²]
+
+	print("Radius at rest : " + str(round(r_normal, 3)))
+	print("Cross-sectional area at rest :"+ str(round(A0_normal, 3)))
 
 	# Space and time discretisation
 
@@ -406,19 +508,30 @@ if __name__ == '__main__':
 	# Setting anomalies in the vessel
 
 	stenosis = False 				# Set to True if there is a stenosis in the vessel
-	aneurysm = False 				# Set to True if there is an aneurysm in the vessel
+	aneurysm = False				# Set to True if there is an aneurysm in the vessel
 
-	x_start = 8						# Start of the anomaly 
-	x_end = 13						# End of the anomaly
+	x_start = 6						# Start of the anomaly 
+	x_end = 12						# End of the anomaly
 	index_start = ceil(x_start/dx)  # Index of the start of the anomaly
 	index_end = ceil(x_end/dx)		# Index of the end of the anomaly
 	normalized_vec = np.linspace(0,1, index_end-index_start) # This vector is created only for the bump since the arg must be in [0,1]
 	x_anomaly = 0.50				# Location of the maximum point of the bump (in [0,1])
 	x_width = 1 					# Width of the bump (in [0,L])
-	a = 0.2*r_normal 				# Amplitude of the bump (in [0,r0], such a restriction is made to avoid r <=0 with stenosis)
+	a = 0.1*r_normal 				# Amplitude of the bump (in [0,r0], such a restriction is made to avoid r <=0 with stenosis)
 
 	r = r_normal*np.ones_like(x)
-	r[index_start:index_end] = HicksHenneBump(normalized_vec, x_anomaly, x_width, a, r_normal, stenosis, aneurysm)
+	if aneurysm: 
+		r = r_normal + gaussian_aneurysm(x, a, mu, 1)
+		drdz = gaussian_derivative(x, a, mu, 1)
+	elif stenosis:
+		r = r_normal - gaussian_aneurysm(x, a, mu, 1)
+		drdz = -gaussian_derivative(x, a, mu, 1)
+	else:
+		drdz = np.zeros_like(r)
+	
+	#r[index_start:index_end] = HicksHenneBump(normalized_vec, x_anomaly, x_width, a, r_normal, stenosis, aneurysm)
+	#drdz = drdx(x, stenosis, aneurysm, x_anomaly, x_width, a, x_start, x_end) 
+	
 	A0 = np.pi*(r**2)
 
 	# Parameters to estimate alpha empirically based on https://doi.org/10.1114/1.1326031
@@ -426,9 +539,11 @@ if __name__ == '__main__':
 	k1 = 2.0e7	 					# Constant 1 [g/(s² cm)]
 	k2 = -22.53 					# Constant 2 [cm^-1]
 	k3 = 8.65e5 					# Constant 3 [g/(s² cm)]
-	alpha = (k1*np.exp(k2*r_normal) + k3)/(2*A0_normal) # Elastance [g/(cm^3.s^2)]
-	print(alpha)
-
+	alpha = (k1*np.exp(k2*r) + k3)/(2*A0) # Elastance [g/(cm^3.s^2)]
+	
+	print("Elasticity at the inlet : " + str(round(alpha[0],2)))
+	dalphadr = (k1*k2*np.exp(k2*r))/(2*A0) - (1/(A0*r))*(k1*np.exp(k2*r) + k3)
+	
 	# 3WK BC parameters
 
 	R1 = 13900						# First resistance [g/s * cm^{-4}]
@@ -442,7 +557,7 @@ if __name__ == '__main__':
 
 	# Plot parameters and variable used for visualisation
 
-	plot_graphs = True				# Set to True if you want to see the graphs during the simulation (graphs will still show up at the end if False)
+	plot_graphs = True				# Set to True if you want to see the graphs during the simulation
 	time_interval = 1000 			# Number of time steps between each plot update 
 	t_min_plot = 2*T 				# Minimum time to plot [s] (Start of second cycle)
 	t_max_plot = 3*T 				# Maximum time to plot [s] (End of second cycle)
@@ -456,7 +571,6 @@ if __name__ == '__main__':
 	A_data = np.zeros_like(Q_data)
 
 	# Variables needed in LW 2 steps scheme (Speed + Pressure)
-	#A = 0.65*np.ones(nx) #A0.copy()
 	
 	A = A0.copy()
 	Q = np.zeros_like(A) 
@@ -469,22 +583,27 @@ if __name__ == '__main__':
 
 	A0_half_m = 0.5*(A0[1:-1] + A0[0:-2])
 	A0_half_p = 0.5*(A0[1:-1] + A0[2:]) 
-	plt.figure()
-	plt.plot(x,A)
-	#plt.show()
 
+	drdz_half_m = 0.5*(drdz[1:-1] + drdz[0:-2])
+	drdz_half_p = 0.5*(drdz[1:-1] + drdz[2:])
+
+	alpha_half_m = 0.5*(alpha[1:-1] + alpha[0:-2])
+	alpha_half_p = 0.5*(alpha[1:-1] + alpha[2:])
+
+	dalpha_half_m = 0.5*(dalphadr[1:-1] + dalphadr[0:-2])
+	dalpha_half_p = 0.5*(dalphadr[1:-1] + dalphadr[2:])
+	
 	dtdx = dt/dx
 	dtover2 = dt/2
 
-
-	for n in tqdm(range(1,nt)): 	# tqdm is here to give an approximation of the time left, so we dont wait in front of the screen doing nothing :)
+	for n in tqdm(range(1,nt)): # tqdm is here to give an approximation of the time left, so we dont wait in front of the screen doing nothing :)
 	
 		# Inlet conditions 
-		A[0], Q[0] = inlet_bc(Q_inlet, n, A, Q, dx, dt, mu, rho, alpha, T)
+		A[0], Q[0] = inlet_bc(Q_inlet, n, A, Q, dx, dt, mu, rho, alpha, dalphadr, T, drdz)
 
 		
 		# Outlet conditions
-		A[-1], Q[-1] = WK_outlet_bc(R1, R2, C, Q, A, A0, dx, dt, mu, rho, alpha, diastolic_pressure)
+		A[-1], Q[-1] = WK_outlet_bc(R1, R2, C, Q, A, A0, dx, dt, mu, rho, alpha, dalphadr, diastolic_pressure, drdz, drdz_half_p, drdz_half_m)
 		
 
 		# Half time/space step 
@@ -493,24 +612,27 @@ if __name__ == '__main__':
 		A_half_m = 0.5 * (A[1:-1] + A[0:-2]) - 0.5 * dtdx * (Q[1:-1] - Q[0:-2]) 
 
 		Q_half_p = 0.5 * (Q[2:] + Q[1:-1]) - 0.5* dtdx * (Flux(Q,A,A0,alpha,rho, j = 2) - Flux(Q,A,A0, alpha, rho, j = 1, k = -1)) \
-			+ 0.5*(dtover2) * (Source(Q,A,mu,rho, j = 2) + Source(Q,A,mu,rho, j =1, k = -1))
+			+ dtover2 * (Source(Q,A,A0, mu,rho, drdz,alpha, dalphadr, j = 2) + Source(Q,A,A0,mu,rho,drdz,alpha,dalphadr, j =1, k = -1))
 		
 		Q_half_m = 0.5 * (Q[1:-1] + Q[0:-2]) - 0.5* dtdx * (Flux(Q,A,A0,alpha,rho, j = 1, k = -1) - Flux(Q,A,A0, alpha, rho, j = 0, k = -2)) \
-			+ 0.5*(dtover2) * (Source(Q,A,mu,rho, j = 1, k = -1) + Source(Q,A,mu,rho, j =0, k = -2))
+			+ dtover2 * (Source(Q,A,A0,mu,rho,drdz,alpha, dalphadr, j = 1, k = -1) + Source(Q,A,A0,mu,rho, drdz,alpha, dalphadr, j =0, k = -2))
 		
 		# Full step
 		
 		A[1:-1] = A[1:-1] - dtdx * (Q_half_p - Q_half_m)
 		
-		Q[1:-1] = Q[1:-1] - dtdx * (Flux(Q_half_p, A_half_p, A0_half_p, alpha, rho, j = 0) - Flux(Q_half_m, A_half_m, A0_half_m, alpha, rho, j = 0))\
-				+ dtover2 * (Source(Q_half_p, A_half_p, mu, rho, j = 0) + Source(Q_half_m, A_half_m, mu, rho, j = 0)) 
+		Q[1:-1] = Q[1:-1] - dtdx * (Flux(Q_half_p, A_half_p, A0_half_p, alpha_half_p, rho, j = 0)\
+			    - Flux(Q_half_m, A_half_m, A0_half_m, alpha_half_m, rho, j = 0))\
+				+ dtover2 * (Source(Q_half_p, A_half_p, A0_half_p , mu, rho,drdz_half_p, alpha_half_p,dalpha_half_p,j = 0) \
+		 		+ Source(Q_half_m, A_half_m, A0_half_m, mu, rho,drdz_half_m,alpha_half_m,dalpha_half_m, j = 0)) 
 		
 		# Checking if the cfl condition is still satisfied 
 		
 		mean_u = np.mean(Q/A)
+		mean_alpha = np.mean(alpha)
 
 		# Checking if the CFL condition is satisfied
-		CFL_condition(mean_u, A0_normal,  alpha, rho, dx, dt, n, nt)
+		CFL_condition(mean_u, A0_normal,  mean_alpha, rho, dx, dt, n, nt)
 
 		if n % time_interval == 0:
 			# Live plot (optional), it tends to slow down the simulation + window might superpose with other windows
@@ -545,7 +667,7 @@ if __name__ == '__main__':
 				plt.xlabel('Position (cm)')
 				plt.ylabel('U (cm/s)')
 				plt.xlim([0, L])
-				plt.ylim([0, 10])
+				plt.ylim([0, 200])
 				plt.grid(True)
 
 				plt.subplot(4, 1, 4)
@@ -578,54 +700,55 @@ if __name__ == '__main__':
 	else:
 		pass
 
-	P_data = diastolic_pressure + (alpha * ((A_data) - A0))/1333.322  # Pressure in mmHg | 
+	P_data = (alpha * ((A_data) - A0))/1333.322  # Pressure in mmHg | 
 	U_data = Q_data/A_data
 
 	print(np.max(A_data[:,:]))
 	print(np.max(P_data[:,:]))
-	fig = plt.figure()
-	ax = fig.add_subplot(111, projection='3d')
-	X, Y = np.meshgrid(time_plot, x)
-	surf = ax.plot_surface(X, Y, A_data.T, rstride=1, cstride=1, cmap=cm.viridis,
-						   linewidth=0, antialiased=False)
-	ax.set_xlabel('t (s)')
-	ax.set_ylabel('z (cm)')
-	ax.set_zlabel('Cross sectionnal area (cm²)')
-	ax.set_xlim([t_min_plot, t_max_plot])
-	ax.set_ylim([min(x), max(x)])
-	fig.colorbar(surf, shrink=0.5, aspect=5)
+	if plot_graphs:
+		fig = plt.figure()
+		ax = fig.add_subplot(111, projection='3d')
+		X, Y = np.meshgrid(time_plot, x)
+		surf = ax.plot_surface(X, Y, A_data.T, rstride=1, cstride=1, cmap=cm.viridis,
+							linewidth=0, antialiased=False)
+		ax.set_xlabel('t (s)')
+		ax.set_ylabel('z (cm)')
+		ax.set_zlabel('Cross sectionnal area (cm²)')
+		ax.set_xlim([t_min_plot, t_max_plot])
+		ax.set_ylim([min(x), max(x)])
+		fig.colorbar(surf, shrink=0.5, aspect=5)
 
-	fig3 = plt.figure()
-	ax3 = fig3.add_subplot(111, projection='3d')
-	surf3 = ax3.plot_surface(X, Y, U_data.T, rstride=1, cstride=1, cmap=cm.viridis,
-						   linewidth=0, antialiased=False)
-	ax3.set_xlabel('t (s)')
-	ax3.set_ylabel('z (cm)')
-	ax3.set_zlabel('Velocity (cm/s)')
-	ax3.set_xlim([t_min_plot, t_max_plot])
-	ax3.set_ylim([min(x), max(x)])
-	fig3.colorbar(surf3, shrink=0.5, aspect=5)
+		fig3 = plt.figure()
+		ax3 = fig3.add_subplot(111, projection='3d')
+		surf3 = ax3.plot_surface(X, Y, U_data.T, rstride=1, cstride=1, cmap=cm.viridis,
+							linewidth=0, antialiased=False)
+		ax3.set_xlabel('t (s)')
+		ax3.set_ylabel('z (cm)')
+		ax3.set_zlabel('Velocity (cm/s)')
+		ax3.set_xlim([t_min_plot, t_max_plot])
+		ax3.set_ylim([min(x), max(x)])
+		fig3.colorbar(surf3, shrink=0.5, aspect=5)
 
-	fig2 = plt.figure()
-	ax2 = fig2.add_subplot(111, projection='3d')
-	surf2 = ax2.plot_surface(X, Y, Q_data.T, rstride=1, cstride=1, cmap=cm.viridis,
-						   linewidth=0, antialiased=False)
-	ax2.set_xlabel('t (s)')
-	ax2.set_ylabel('z (cm)')
-	ax2.set_zlabel('Flow rate (cm^3/s)')
-	ax2.set_xlim([t_min_plot, t_max_plot])
-	ax2.set_ylim([min(x), max(x)])
-	fig2.colorbar(surf2, shrink=0.5, aspect=5)
+		fig2 = plt.figure()
+		ax2 = fig2.add_subplot(111, projection='3d')
+		surf2 = ax2.plot_surface(X, Y, Q_data.T, rstride=1, cstride=1, cmap=cm.viridis,
+							linewidth=0, antialiased=False)
+		ax2.set_xlabel('t (s)')
+		ax2.set_ylabel('z (cm)')
+		ax2.set_zlabel('Flow rate (cm^3/s)')
+		ax2.set_xlim([t_min_plot, t_max_plot])
+		ax2.set_ylim([min(x), max(x)])
+		fig2.colorbar(surf2, shrink=0.5, aspect=5)
 
-	fig_pressure = plt.figure()
-	ax_pressure = fig_pressure.add_subplot(121)
-	ax_pressure.plot(time_plot, P_data.T[int(0.33*np.shape(P_data)[1]), :]) #approx 6cm
-	ax_pressure.set_xlabel('t (s)')
-	ax_pressure.set_ylabel('Pressure [mmHg]')
-	ax_pressure2 = fig_pressure.add_subplot(122)
-	ax_pressure2.plot(time_plot, P_data.T[int(0.66*np.shape(P_data)[1]), :]) #approx 12CM
-	ax_pressure2.set_xlabel('t (s)')
-	ax_pressure2.set_ylabel('Pressure [mmHg]')
-	plt.show()
+		fig_pressure = plt.figure()
+		ax_pressure = fig_pressure.add_subplot(121)
+		ax_pressure.plot(time_plot, diastolic_pressure + P_data.T[int(0.33*np.shape(P_data)[1]), :]) #approx 6cm
+		ax_pressure.set_xlabel('t (s)')
+		ax_pressure.set_ylabel('Pressure [mmHg]')
+		ax_pressure2 = fig_pressure.add_subplot(122)
+		ax_pressure2.plot(time_plot, diastolic_pressure + P_data.T[int(0.66*np.shape(P_data)[1]), :]) #approx 12CM
+		ax_pressure2.set_xlabel('t (s)')
+		ax_pressure2.set_ylabel('Pressure [mmHg]')
+		plt.show()
 
 	write_data(A_data, P_data, Q_data, x, time_plot)
