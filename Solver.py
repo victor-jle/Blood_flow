@@ -137,10 +137,10 @@ def write_data(A, P, Q, x, t):
 	if not exists("data/"):
 		makedirs("data/")
 	np.savetxt("data/area.csv", A[:,:], delimiter=',')
-	np.savetxt("data/pressure1.csv", P[:,:], delimiter=',')
+	np.savetxt("data/pressure.csv", P[:,:], delimiter=',')
 	np.savetxt("data/flow.csv", Q[:,:], delimiter=',')
-	np.savetxt("data/xpoint1.csv", x[:], delimiter=',')
-	np.savetxt("data/tpoint1.csv", t[:], delimiter=',')
+	np.savetxt("data/xpoint.csv", x[:], delimiter=',')
+	np.savetxt("data/tpoint.csv", t[:], delimiter=',')
 
 def periodic(t, T):
 	"""
@@ -227,8 +227,8 @@ def WK_outlet_bc(R1, R2, C, Q, A, A0, dx, dt, mu, rho, alpha, dalphadr, diastoli
 			+ (dt/2) * (Source(Q,A,A0,mu,rho,drdz,alpha,dalphadr, j = -2, k = -1) + Source(Q,A,A0,mu,rho,drdz,alpha,dalphadr, j = -3, k = -2)))
 	
 	Q_mm = Q[-2] - dt/dx * (Q_np_mp**2/A_np_mp + alpha/(2*rho) * (A_np_mp**2 - A0[-2]**2) - Q_np_mm**2/A_np_mm - alpha[-2]/(2*rho) * (A_np_mm**2 - A0[-2]**2))\
-		 - (dt/2) * ((8*np.pi*mu)/(rho) * (Q_np_mp/A_np_mp + Q_np_mm/A_np_mm) - (1/(2*rho))*((A_np_mp**2 - A0[-2]**2)*dalpha_half_p[-2] - 4*((np.pi)**2) * (np.sqrt(A0[-2]/np.pi))**3 * alpha_half_p[-2])*drdzhp[-2]\
-	    - (1/(2*rho))*((A_np_mm**2 - A0[-2]**2)*dalpha_half_m[-2] - 4*((np.pi)**2) * (np.sqrt(A0[-2]/np.pi))**3 * alpha_half_m[-2])*drdzhm[-2])
+		 - (dt/2) * ((8*np.pi*mu)/(rho) * (Q_np_mp/A_np_mp + Q_np_mm/A_np_mm) - (1/(2*rho))*((A_np_mp**2 - A0[-2]**2)*dalpha_half_p[-2] - 4*((np.pi)**2) * (np.sqrt(A0[-2]/np.pi))**3 * alpha_half_p[-2])*drdzhp[-2] \
+		- (1/(2*rho))*((A_np_mm**2 - A0[-2]**2)*dalpha_half_m[-2] - 4*((np.pi)**2) * (np.sqrt(A0[-2]/np.pi))**3 * alpha_half_m[-2])*drdzhm[-2])
 
 	k = 0
 	while k < 1000:
@@ -512,6 +512,8 @@ if __name__ == '__main__':
 
 	x_start = 6						# Start of the anomaly 
 	x_end = 12						# End of the anomaly
+	mu_pos = 0.5 * (x_start + x_end)# position of the anomaly max bump
+	sigma = abs(x_end - mu_pos)/3 	# Parameters to model the width of the bump
 	index_start = ceil(x_start/dx)  # Index of the start of the anomaly
 	index_end = ceil(x_end/dx)		# Index of the end of the anomaly
 	normalized_vec = np.linspace(0,1, index_end-index_start) # This vector is created only for the bump since the arg must be in [0,1]
@@ -521,11 +523,11 @@ if __name__ == '__main__':
 
 	r = r_normal*np.ones_like(x)
 	if aneurysm: 
-		r = r_normal + gaussian_aneurysm(x, a, mu, 1)
-		drdz = gaussian_derivative(x, a, mu, 1)
+		r = r_normal + gaussian_aneurysm(x, a, mu_pos, sigma)
+		drdz = gaussian_derivative(x, a, mu_pos, sigma)
 	elif stenosis:
-		r = r_normal - gaussian_aneurysm(x, a, mu, 1)
-		drdz = -gaussian_derivative(x, a, mu, 1)
+		r = r_normal - gaussian_aneurysm(x, a, mu_pos, sigma)
+		drdz = -gaussian_derivative(x, a, mu_pos, sigma)
 	else:
 		drdz = np.zeros_like(r)
 	
