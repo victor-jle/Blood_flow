@@ -26,8 +26,10 @@ Part I: Application to Stent Design. IEEE Transactions on Biomedical Engineering
 
 TO DO : 
 	- Priority : Check dB/dr dr/dz term 
-    - Update pressure boundary condition
+	- Fix slight discountinuity in Three_wave component when it is called with t%T as arg  
+    - Update and verify pressure boundary condition
 	- Dispatch function in multiples scripts for readability
+	- Editing code so it can take a config file as an argument.
 '''
 
 def CFL_condition(u, a0, alpha, rho, dx, dt, n, nt):
@@ -73,36 +75,42 @@ def Three_wave_component(t):
 	Returns :
 	- Q(t) : float or array corresponding to the blood flow at the inlet for the time t
 	"""
-	Q0 = 3.0;                  		# Peak flow rate (cm^3/s)
+	Q0 = 3.0  						# Peak flow rate (cm^3/s)
 
-	relative_pulse_amplitude = 1;   # Relative pulse scaling
-	#n_cycles = 2;                  # Number of heart cycles
-	heart_rate = 75;                # Heart rate in beats per minute (bpm)
-	T = 60 / heart_rate;      		# Heartbeat period (seconds)
+	relative_pulse_amplitude = 1	#Relative pulse scaling
 
 	# Three-phase pulse parameters (user-defined as fractions of the heart cycle)
-	amp_phase1 = 0.25 * Q0;         # Amplitude of phase 1 (systolic peak)
-	amp_phase2 = 0.115 * Q0;        # Amplitude of phase 2 (diastolic trough)
-	amp_phase3 = 0.05 * Q0;         # Amplitude of phase 3 (resting phase)
+	amp_phase1 = 0.25 * Q0			# Amplitude of phase 1 (systolic peak)
+	amp_phase2 = 0.115 * Q0			# Amplitude of phase 2 (diastolic trough)
+	amp_phase3 = 0.05 * Q0			# Amplitude of phase 3 (resting phase)
 
-	t_phase1 = 0.30 * T;        
-	t_phase2 = 0.62 * T;       
-	t_phase3 = 0.75 * T;       
+	t_phase1 = 0.30 * T
+	t_phase2 = 0.62 * T
+	t_phase3 = 0.75 * T
 
-	len_phase1 = 0.48 * T;     
-	len_phase2 = 0.3 * T;      
-	len_phase3 = 0.3 * T;      
+	len_phase1 = 0.48 * T
+	len_phase2 = 0.3 * T
+	len_phase3 = 0.3 * T
 
-	return Q0 + relative_pulse_amplitude*((amp_phase1 * np.exp(-((t - t_phase1)**2) / (2 * (len_phase1 / 3)**2))) \
-		+ (amp_phase2 * np.exp(-((t - t_phase2)**2) / (2 * (len_phase2 / 3)**2))) \
-			+ (amp_phase3 * np.exp(-((t - t_phase3)**2) / (2 * (len_phase3 / 3)**2))))
+	Q_res = Q0
+	for cycle in range(n_cycle):
+		t_cycle = t - cycle*T
+		Q_res += relative_pulse_amplitude * (
+        	amp_phase1 * np.exp(-((t_cycle - t_phase1)**2) / (2 * (len_phase1 / 3)**2)) +
+        	amp_phase2 * np.exp(-((t_cycle - t_phase2)**2) / (2 * (len_phase2 / 3)**2)) +
+        	amp_phase3 * np.exp(-((t_cycle - t_phase3)**2) / (2 * (len_phase3 / 3)**2))
+    	)
+	return Q_res
 
-def get_data(arg):
+def get_data(arg, **kwargs):
 	"""
 	Returns the inlet flow rate at time t (either float or array)
 
 	Parameters : 
 	- argument passed when calling the python script
+	
+	- Keyword Argument :
+		- hr : int corresponding to the number of bpm
 
 	Returns :
 	- f : Function interpolating flow rate from the csv file [cm3/s]
@@ -110,7 +118,11 @@ def get_data(arg):
 	"""
 
 	if len(arg) == 1:
-		return 60/75, Three_wave_component
+		if 'hr' in kwargs:
+			T = 60/kwargs['hr']
+		else:
+			raise ValueError("There is no value to the heart rate.")
+		return T, Three_wave_component
 	else:
 		path = str(arg[1])
 		data = pd.read_csv(path, header=None)
@@ -141,6 +153,8 @@ def write_data(A, P, Q, x, t):
 	np.savetxt("data/flow.csv", Q[:,:], delimiter=',')
 	np.savetxt("data/xpoint.csv", x[:], delimiter=',')
 	np.savetxt("data/tpoint.csv", t[:], delimiter=',')
+	print(80*"-")
+	print("Data have been saved in data directory")
 
 def periodic(t, T):
 	"""
@@ -227,8 +241,7 @@ def WK_outlet_bc(R1, R2, C, Q, A, A0, dx, dt, mu, rho, alpha, dalphadr, diastoli
 			+ (dt/2) * (Source(Q,A,A0,mu,rho,drdz,alpha,dalphadr, j = -2, k = -1) + Source(Q,A,A0,mu,rho,drdz,alpha,dalphadr, j = -3, k = -2)))
 	
 	Q_mm = Q[-2] - dt/dx * (Q_np_mp**2/A_np_mp + alpha/(2*rho) * (A_np_mp**2 - A0[-2]**2) - Q_np_mm**2/A_np_mm - alpha[-2]/(2*rho) * (A_np_mm**2 - A0[-2]**2))\
-		 - (dt/2) * ((8*np.pi*mu)/(rho) * (Q_np_mp/A_np_mp + Q_np_mm/A_np_mm) - (1/(2*rho))*((A_np_mp**2 - A0[-2]**2)*dalpha_half_p[-2] - 4*((np.pi)**2) * (np.sqrt(A0[-2]/np.pi))**3 * alpha_half_p[-2])*drdzhp[-2] \
-		- (1/(2*rho))*((A_np_mm**2 - A0[-2]**2)*dalpha_half_m[-2] - 4*((np.pi)**2) * (np.sqrt(A0[-2]/np.pi))**3 * alpha_half_m[-2])*drdzhm[-2])
+		 - (dt/2) * ((8*np.pi*mu)/(rho) * (Q_np_mp/A_np_mp + Q_np_mm/A_np_mm) - (1/(2*rho))*((A_np_mp**2 - A0[-2]**2)*dalpha_half_p[-2] - 4*((np.pi)**2) * (np.sqrt(A0[-2]/np.pi))**3 * alpha_half_p[-2])*drdzhp[-2] - (1/(2*rho))*((A_np_mm**2 - A0[-2]**2)*dalpha_half_m[-2] - 4*((np.pi)**2) * (np.sqrt(A0[-2]/np.pi))**3 * alpha_half_m[-2])*drdzhm[-2])
 
 	k = 0
 	while k < 1000:
@@ -493,15 +506,20 @@ if __name__ == '__main__':
 	r_normal = 3.7e-1  				# Vessel radius at rest in a normal vessel [cm]
 	A0_normal = np.pi * r_normal**2 # Cross sectionnal area at rest [cm²]
 
-	print("Radius at rest : " + str(round(r_normal, 3)))
-	print("Cross-sectional area at rest :"+ str(round(A0_normal, 3)))
+	print(f"Radius at rest : {r_normal:.2e} cm")
+	print(f"Cross-sectional area at rest : {A0_normal:.2e} cm^2")
 
 	# Space and time discretisation
 
 	dx = L /(nx-1) 					# Space step [cm]
 	dt = 1e-5						# Time step [cm] (should be using CFL condition)
-	T_final = 3						# Time of simulation [s]
-	nt = ceil(T_final/dt)			# Number of time steps
+	n_cycle = 4						# Number of cardiac cycle
+	heart_rate = 80					# Number of bpm 
+
+	T, Q_inlet = get_data(sys.argv, hr = heart_rate) # T : Cycle duration [s] | Q_inlet : (function) Inlet flow rate [cm^3/s]
+
+	T_final = n_cycle*T				# Time of simulation [s]
+	nt = round(T_final/dt)			# Number of time steps
 	t = np.linspace(0,T_final, nt)  # Time discretisation 
 	x = np.linspace(0, L, nx)		# Space discretisation
 
@@ -519,7 +537,7 @@ if __name__ == '__main__':
 	normalized_vec = np.linspace(0,1, index_end-index_start) # This vector is created only for the bump since the arg must be in [0,1]
 	x_anomaly = 0.50				# Location of the maximum point of the bump (in [0,1])
 	x_width = 1 					# Width of the bump (in [0,L])
-	a = 0.1*r_normal 				# Amplitude of the bump (in [0,r0], such a restriction is made to avoid r <=0 with stenosis)
+	a = 0.001*r_normal 				# Amplitude of the bump (in [0,r0], such a restriction is made to avoid r <=0 with stenosis)
 
 	r = r_normal*np.ones_like(x)
 	if aneurysm: 
@@ -543,7 +561,7 @@ if __name__ == '__main__':
 	k3 = 8.65e5 					# Constant 3 [g/(s² cm)]
 	alpha = (k1*np.exp(k2*r) + k3)/(2*A0) # Elastance [g/(cm^3.s^2)]
 	
-	print("Elasticity at the inlet : " + str(round(alpha[0],2)))
+	print(f"Elasticity at the inlet : {alpha[0]:.2e}")
 	dalphadr = (k1*k2*np.exp(k2*r))/(2*A0) - (1/(A0*r))*(k1*np.exp(k2*r) + k3)
 	
 	# 3WK BC parameters
@@ -551,11 +569,6 @@ if __name__ == '__main__':
 	R1 = 13900						# First resistance [g/s * cm^{-4}]
 	R2 = 25300						# Second resistance [g/s * cm^{-4}]
 	C = 1.3384e-6					# Capacitance coefficient [cm^4.s^2/g]
-
-	# Get inlet as a function (:= Q_inlet)
-
-	T, Q_inlet = get_data(sys.argv) # Inlet flow rate [cm^3/s] | Q_inlet Type : function
-	
 
 	# Plot parameters and variable used for visualisation
 
@@ -568,8 +581,8 @@ if __name__ == '__main__':
 	index = 0 						# Index used to plot the graphs
 	i=1
 
-	time_plot = np.linspace(t_min_plot, t_max_plot, int((index_max-index_min)/time_interval) + 1) # Time array used for plotting
-	Q_data = np.zeros((int(((index_max - index_min))/time_interval) +1, nx))
+	time_plot = np.linspace(t_min_plot, t_max_plot, ceil((index_max-index_min)/time_interval) + 1) # Time array used for plotting
+	Q_data = np.zeros((ceil(((index_max - index_min))/time_interval) +1, nx))
 	A_data = np.zeros_like(Q_data)
 
 	# Variables needed in LW 2 steps scheme (Speed + Pressure)
@@ -597,6 +610,9 @@ if __name__ == '__main__':
 	
 	dtdx = dt/dx
 	dtover2 = dt/2
+	
+	if plot_graphs:
+		plt.figure(figsize=(10, 6))
 
 	for n in tqdm(range(1,nt)): # tqdm is here to give an approximation of the time left, so we dont wait in front of the screen doing nothing :)
 	
@@ -639,7 +655,6 @@ if __name__ == '__main__':
 		if n % time_interval == 0:
 			# Live plot (optional), it tends to slow down the simulation + window might superpose with other windows
 			if plot_graphs:
-				plt.figure(1, figsize=(10, 6))
 				plt.clf()
 
 				plt.subplot(4, 1, 1)
@@ -674,7 +689,7 @@ if __name__ == '__main__':
 
 				plt.subplot(4, 1, 4)
 				plt.plot(x, alpha*(A-A0)/1333.22 + diastolic_pressure, 'r-', linewidth=1.5)
-				plt.title(f'Transmural Pressure (P) at t = {n * dt:.2f} s')
+				plt.title(f'Blood Pressure (P) at t = {n * dt:.2f} s')
 				plt.xlabel('Position (cm)')
 				plt.ylabel('P (mmHg)')
 				plt.xlim([0, L])
@@ -690,8 +705,8 @@ if __name__ == '__main__':
 			index += 1
 			
 	# plot the results
-	#plt.figure()
-	#plt.plot(time_plot, Q_inlet(periodic(time_plot,T)))
+	plt.figure("Inflow Function Q(t, 0)", figsize=(10,6))
+	plt.plot(t, Q_inlet(periodic(t,T)), 'k-')
 	
 	# Hard-coding to fix bug related to vizualisation for some time interval values where the last column isnt filled
 
@@ -705,10 +720,11 @@ if __name__ == '__main__':
 	P_data = (alpha * ((A_data) - A0))/1333.322  # Pressure in mmHg | 
 	U_data = Q_data/A_data
 
-	print(np.max(A_data[:,:]))
-	print(np.max(P_data[:,:]))
+	print(f"Maximal value of cross sectional area : {np.max(A_data[:,:]):.2e} cm^2")
+	print(f"Maximal value of the transmural pressure : {np.max(P_data[:,:]):.2e} mmHg")
+
 	if plot_graphs:
-		fig = plt.figure()
+		fig = plt.figure("Evolution of cross-sectional area")
 		ax = fig.add_subplot(111, projection='3d')
 		X, Y = np.meshgrid(time_plot, x)
 		surf = ax.plot_surface(X, Y, A_data.T, rstride=1, cstride=1, cmap=cm.viridis,
@@ -720,7 +736,7 @@ if __name__ == '__main__':
 		ax.set_ylim([min(x), max(x)])
 		fig.colorbar(surf, shrink=0.5, aspect=5)
 
-		fig3 = plt.figure()
+		fig3 = plt.figure("Evolution of blood velocity")
 		ax3 = fig3.add_subplot(111, projection='3d')
 		surf3 = ax3.plot_surface(X, Y, U_data.T, rstride=1, cstride=1, cmap=cm.viridis,
 							linewidth=0, antialiased=False)
@@ -731,7 +747,7 @@ if __name__ == '__main__':
 		ax3.set_ylim([min(x), max(x)])
 		fig3.colorbar(surf3, shrink=0.5, aspect=5)
 
-		fig2 = plt.figure()
+		fig2 = plt.figure("Evolution of blood flow rate")
 		ax2 = fig2.add_subplot(111, projection='3d')
 		surf2 = ax2.plot_surface(X, Y, Q_data.T, rstride=1, cstride=1, cmap=cm.viridis,
 							linewidth=0, antialiased=False)
@@ -742,7 +758,7 @@ if __name__ == '__main__':
 		ax2.set_ylim([min(x), max(x)])
 		fig2.colorbar(surf2, shrink=0.5, aspect=5)
 
-		fig_pressure = plt.figure()
+		fig_pressure = plt.figure("Evolution of blood pressure")
 		ax_pressure = fig_pressure.add_subplot(121)
 		ax_pressure.plot(time_plot, diastolic_pressure + P_data.T[int(0.33*np.shape(P_data)[1]), :]) #approx 6cm
 		ax_pressure.set_xlabel('t (s)')
