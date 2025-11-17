@@ -74,7 +74,7 @@ python3 Artery.py config_bif.ini
 This solver was developped by Victor Juille as part of a research internship on cerebral blood flow modeling, under the supervision of Pr Sampsa Pursiainen and Dr Maryamolsadat Samavaki at Tampere University.
 
 **Contacts** : 
-- victor.juille@etudiant.univ-reims.fr
+- victor.juille@univ-lille.fr
 - maryamolsadat.samavaki@uef.fi | m.samavaki@yahoo.com
 - sampsa.pursiainen@tuni.fi
 
